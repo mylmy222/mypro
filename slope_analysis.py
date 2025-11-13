@@ -195,6 +195,8 @@ class AnalysisParams:
     daylight_tolerance_deg: float = 20.0
     plunging_min_deg: float = 10.0
     do_limit_equilibrium: bool = False
+    grouping_eps_deg: float = 12.0
+    grouping_min_samples: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +326,9 @@ def region_grow_plane(
 def estimate_patch_area(points: np.ndarray, params: AnalysisParams) -> float:
     patch_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
     try:
-        mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(patch_cloud, params.alpha_radius)
+        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(
+            patch_cloud, params.alpha_radius
+        )
         return float(mesh.get_surface_area())
     except RuntimeError:
         return float(len(points)) * (params.voxel_size**2)
@@ -495,12 +499,13 @@ def attach_traces(patches: Sequence[PlanePatch], slope_tin: Optional[Dict[str, n
 # Grouping + spacing
 
 
-def cluster_planes(patches: Sequence[PlanePatch]) -> Dict[int, JointGroup]:
+def cluster_planes(patches: Sequence[PlanePatch], params: AnalysisParams) -> Dict[int, JointGroup]:
     if not patches:
         return {}
     poles = np.array([_upper_hemisphere(p.normal) for p in patches])
     if _HAS_SKLEARN:
-        clustering = DBSCAN(eps=math.radians(12.0), min_samples=3, metric="euclidean").fit(poles)
+        eps = math.radians(params.grouping_eps_deg)
+        clustering = DBSCAN(eps=eps, min_samples=max(1, params.grouping_min_samples), metric="euclidean").fit(poles)
         labels = clustering.labels_
     else:  # pragma: no cover - fallback
         LOGGER.warning("scikit-learn not installed; assigning all planes to group 0")
@@ -532,6 +537,166 @@ def compute_group_spacing(group: JointGroup, patches: Sequence[PlanePatch], clou
     distances = sorted(float(np.dot(group.normal, c)) for c in centroids)
     diffs = np.diff(distances)
     group.spacing = float(np.median(diffs)) if len(diffs) else None
+
+
+# ---------------------------------------------------------------------------
+# Interactive QA loops for plane detection + grouping
+
+
+def _review_dialog(
+    title: str,
+    summaries: Sequence[str],
+    description: str,
+) -> str:
+    """Shared helper to ask the user whether the current result is acceptable."""
+
+    verdict_default = "accept"
+    try:
+        import tkinter as tk
+    except Exception:
+        LOGGER.warning("Tkinter unavailable; accepting current %s", title)
+        return verdict_default
+    try:
+        root = tk.Tk()
+    except Exception:
+        LOGGER.warning("No display for Tkinter; accepting current %s", title)
+        return verdict_default
+
+    root.title(title)
+    left = tk.Frame(root)
+    left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+    right = tk.Frame(root)
+    right.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=10)
+
+    tk.Label(left, text=description, anchor="w").pack(anchor="w")
+    listbox = tk.Listbox(left, width=70, height=20)
+    if summaries:
+        for text in summaries:
+            listbox.insert(tk.END, text)
+    else:
+        listbox.insert(tk.END, "暂无可显示的数据。")
+    listbox.pack(fill=tk.BOTH, expand=True)
+
+    choice = tk.StringVar(value=verdict_default)
+    tk.Label(right, text="选择识别效果:").pack(anchor="w")
+    options = [
+        ("过分割", "over"),
+        ("合适", verdict_default),
+        ("未完全识别", "under"),
+    ]
+    for text, value in options:
+        tk.Radiobutton(right, text=text, variable=choice, value=value).pack(anchor="w", pady=4)
+
+    result: List[str] = []
+
+    def confirm() -> None:
+        result.append(choice.get())
+        root.destroy()
+
+    tk.Button(right, text="确认", command=confirm).pack(pady=12)
+    root.mainloop()
+    return result[0] if result else verdict_default
+
+
+def review_plane_segments_dialog(patches: Sequence[PlanePatch]) -> str:
+    summaries = [
+        f"面 {p.id}: dip {p.dip:.1f}° / strike {p.strike:.1f}° / 面积 {p.area:.2f} m² / 点数 {len(p.indices)}"
+        for p in patches
+    ]
+    description = f"检测到 {len(patches)} 个结构面，左侧为分割概览。请选择评估。"
+    return _review_dialog("结构面识别确认", summaries, description)
+
+
+def review_grouping_dialog(groups: Dict[int, JointGroup], patches: Sequence[PlanePatch]) -> str:
+    summaries: List[str] = []
+    for gid in sorted(groups.keys()):
+        group = groups[gid]
+        members = [patches[pid] for pid in group.plane_ids]
+        total_area = sum(m.area for m in members)
+        spacing_text = "未知" if group.spacing is None else f"{group.spacing:.2f} m"
+        summaries.append(
+            f"组 {gid}: dip {group.dip:.1f}° / strike {group.strike:.1f}° / 面数 {len(members)} / 总面积 {total_area:.2f} m² / 间距 {spacing_text}"
+        )
+    description = f"当前共分为 {len(groups)} 组，左侧为每组信息。请选择分组质量。"
+    return _review_dialog("结构面分组确认", summaries, description)
+
+
+def adjust_plane_detection_params(params: AnalysisParams, verdict: str) -> None:
+    if verdict == "over":
+        params.ransac_threshold *= 1.15
+        params.region_angle_threshold_deg = min(params.region_angle_threshold_deg + 1.5, 30.0)
+        params.region_distance *= 1.1
+        params.min_plane_points = int(params.min_plane_points * 1.1)
+        LOGGER.info(
+            "用户反馈过分割: ransac=%.3f, 区域角度=%.1f°, 区域半径=%.3f, 最小点数=%d",
+            params.ransac_threshold,
+            params.region_angle_threshold_deg,
+            params.region_distance,
+            params.min_plane_points,
+        )
+    elif verdict == "under":
+        params.ransac_threshold = max(params.ransac_threshold * 0.85, params.voxel_size * 0.8)
+        params.region_angle_threshold_deg = max(params.region_angle_threshold_deg - 1.5, 5.0)
+        params.region_distance = max(params.region_distance * 0.85, params.voxel_size * 2.0)
+        params.min_plane_points = max(int(params.min_plane_points * 0.9), 200)
+        LOGGER.info(
+            "用户反馈未完全识别: ransac=%.3f, 区域角度=%.1f°, 区域半径=%.3f, 最小点数=%d",
+            params.ransac_threshold,
+            params.region_angle_threshold_deg,
+            params.region_distance,
+            params.min_plane_points,
+        )
+
+
+def adjust_grouping_params(params: AnalysisParams, verdict: str) -> None:
+    if verdict == "over":
+        params.grouping_eps_deg = min(params.grouping_eps_deg + 2.0, 30.0)
+        params.grouping_min_samples = max(2, params.grouping_min_samples - 1)
+        LOGGER.info(
+            "分组过多: eps=%.1f°, min_samples=%d",
+            params.grouping_eps_deg,
+            params.grouping_min_samples,
+        )
+    elif verdict == "under":
+        params.grouping_eps_deg = max(5.0, params.grouping_eps_deg - 2.0)
+        params.grouping_min_samples += 1
+        LOGGER.info(
+            "分组未完全: eps=%.1f°, min_samples=%d",
+            params.grouping_eps_deg,
+            params.grouping_min_samples,
+        )
+
+
+def run_plane_detection_with_feedback(
+    cloud: o3d.geometry.PointCloud, params: AnalysisParams
+) -> List[PlanePatch]:
+    iteration = 1
+    while True:
+        LOGGER.info("Plane detection iteration %d", iteration)
+        patches = extract_planes(cloud, params)
+        verdict = review_plane_segments_dialog(patches)
+        if verdict == "accept" or verdict not in {"over", "under"}:
+            return patches
+        adjust_plane_detection_params(params, verdict)
+        iteration += 1
+
+
+def run_grouping_with_feedback(
+    patches: Sequence[PlanePatch],
+    params: AnalysisParams,
+    cloud: o3d.geometry.PointCloud,
+) -> Dict[int, JointGroup]:
+    iteration = 1
+    while True:
+        LOGGER.info("Grouping iteration %d", iteration)
+        groups = cluster_planes(patches, params)
+        for group in groups.values():
+            compute_group_spacing(group, patches, cloud)
+        verdict = review_grouping_dialog(groups, patches)
+        if verdict == "accept" or verdict not in {"over", "under"}:
+            return groups
+        adjust_grouping_params(params, verdict)
+        iteration += 1
 
 
 # ---------------------------------------------------------------------------
@@ -858,11 +1023,11 @@ def run_pipeline(args: argparse.Namespace) -> Tuple[
     cleaned = denoise_and_downsample(cloud, params)
     LOGGER.info("After filtering/downsampling: %d points", len(cleaned.points))
     estimate_normals(cleaned, params)
-    patches = extract_planes(cleaned, params)
+    patches = run_plane_detection_with_feedback(cleaned, params)
     slope_plane = detect_slope_plane(patches, params)
     slope_tin = build_slope_tin(slope_plane, cleaned)
     attach_traces(patches, slope_tin)
-    groups = cluster_planes(patches)
+    groups = run_grouping_with_feedback(patches, params, cleaned)
     for group in groups.values():
         compute_group_spacing(group, patches, cleaned)
     LOGGER.info("Detected %d joint sets", len(groups))
