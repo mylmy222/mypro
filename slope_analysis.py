@@ -324,9 +324,7 @@ def region_grow_plane(
 def estimate_patch_area(points: np.ndarray, params: AnalysisParams) -> float:
     patch_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
     try:
-        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(
-            patch_cloud, params.alpha_radius
-        )
+        mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(patch_cloud, params.alpha_radius)
         return float(mesh.get_surface_area())
     except RuntimeError:
         return float(len(points)) * (params.voxel_size**2)
